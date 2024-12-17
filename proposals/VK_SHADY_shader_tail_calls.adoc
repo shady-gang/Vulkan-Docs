@@ -1,0 +1,111 @@
+// Copyright 2021-2024 The Khronos Group Inc.
+//
+// SPDX-License-Identifier: CC-BY-4.0
+
+= VK_SHADY_shader_tail_calls
+:toc: left
+:docs: https://docs.vulkan.org/spec/latest/
+:extensions: {docs}appendices/extensions.html#
+:sectnums:
+// Required so images render in github
+ifndef::images[:images: ../images]
+
+== Problem Statement
+
+The size and scope of shader programs keeps expanding: modern applications have many unique materials and variants thereof which can lead to an explosion in the number of shader specializations.
+This has significant computational and size overhead, due in part to the inability to share compiled common code.
+
+In order to keep the numbers of shader modules and pipelines down, a classic approach applications can resort to are so-called "ubershaders" (or "megakernels") that combine multiple programs into one and use control-flow to pick the variant dynamically.
+Doing so can reduce reducing the number of dispatches/draw commands by moving the decision of what shader variant to run down inside the shader itself, rather than at command recording time.
+
+The ubershader approach has readability and complexity costs, that can be mitigated by better tooling (shader languages and compilers), and also has significant performance hazards due to low occupancy concerns.
+There are two major factors at play:
+
+ * At the subgroup level, having invocations go through different paths can lower performance due to control-flow divergence. This can be addressed by carefully sorting the workload using the desired shader variant as a key.
+
+ * The other concern is resource usage: not all shaders place the same demands on local resources such as registers and workgroup memory, higher usage of which typically leads to fewer concurrent subgroups and loss of performance. Combining all shaders in one program tends to pessimize resource usage for the worst-case scenario.
+
+Ubershaders are effectively a restrictive form of function pointers.
+This proposal aims at supporting a gradual transition towards full support of GPU function pointers in Vulkan.
+
+== Solution Space
+
+* Raytracing pipelines introduced callable shaders which are essentially just functions.
+Such pipelines directly address occupancy concerns by giving the Vulkan implementation the freedom to re-pack invocations across call boundaries.
+However:
+** There are no workgroups, and subgroups are no longer stable.
+This gets in the way of writing co-operative algorithms, making this unsuitable for many compute scenarios.
+** Callable shaders are unavailable in graphics pipelines.
+** Callable shaders require a stack for basic operation.
+
+* Function pointers can be emulated in software, either manually as described or using compiler transformations such as the ones offered in Slang or Shady.
+** Doing so incurrs loss of intent and therefore optimisation opportunities. The driver has no chance to optimize register usage or calling conventions.
+** Because there is still no way to share compiled code without sharing a shader module, this approach is not applicable to situations where incompatible pipelines are required.
+
+* First-class function pointer support would be ideal from a programming model convenience standpoint, but would place significant demands on Vulkan implementations:
+** Without static callgraph information, there would be no way to statically prevent recursion.
+This would either force introducing a stack to support reentrancy, or be left alone as a dangerous form of undefined behaviour.
+** Resource usage, such as register pressure, is no longer reliably statically determinable.
+
+== Proposal
+
+This proposal identifies indirect tail-calls as the ideal stepping stone towards general function pointer support in Vulkan. This extension exposes optional capabilities up to and including first-class function pointers with recursion.
+
+It introduces new features to help SPIR-V producers implement function pointers and related constructs, and on the Vulkan side, introduces an API to query and share such pointers across shader modules and pipelines while keeping control over occupancy.
+
+=== Shader functionality
+
+The `SPV_SHADY_indirect_tail_calls` sister extension introduces new SPIR-V instructions, capabilities and decorations. The baseline level of functionality (required to implement the extension) is as follows:
+
+* The `IndirectlyCallableSHADY` decoration is applied on functions that we will call indirectly at some point. Another way to think about this decoration is that it mandates the function to have a return address at runtime.
+* `OpIndirectTailCallSHADY`: Used to tail-call into another function, the return type of the callee function has to match the return type of the current function, and if non-void, the returned value will be forwarded to the original caller. This instruction may only be used in functions decorated with `IndirectlyCallableSHADY`, as the last instruction of the function.
+* `OpIndirectCallSHADY`: Used to call into an indirect function. Can appear in the static call graph of `IndirectlyCallableSHADY`-decorated functions only if the caller is also decorated with `IndirectUnsafeSHADY` or `ReentrantSHADY`. Otherwise it has to occur in the entry point or a function reachable from it through only `OpFunctionCall`.
+
+If the `ReentrantSHADY` decoration is not placed on a function, it is undefined behaviour to have one invocation be in two or more dynamic instances of that function at the same time.
+In other words, recursive functions that are not strictly tail-recursive need to be decorated with `ReentrantSHADY`. Enabling the corresponding capability will require a runtime stack.
+
+The purpose of `IndirectUnsafeSHADY` is to allow maximal flexibility with indirect calls while still not requiring a stack (every function can use statically allocated storage for its variables). The "unsafe" comes from the impossiblity of statically ruling out recursion.
+
+=== Host functionality
+
+Querying GPU fn addresses on the host
+
+Querying fn resource usage
+
+Shared Funs Pools
+
+== Examples
+
+
+== Issues
+
+=== PROPOSED: Behaviour with non-uniform callees
+
+Gate it behind a capability flag (otherwise UB).
+
+Indirect calls diverge and implicitly reconverge after the call.
+Tail calls diverge more and eventually reconverge where the initial indirect call was made.
+
+=== RESOLVED: Why tailcalls ?
+
+The lack of a stack was historically one of the defining features of shader programming models.
+For a similar historical reasons, plus a focus on peak performance, function calls in have rules that guarantee they can be safely inlined away entirely.
+On the other hand, GPGPU APIs have offered device function pointers for many years making it clear that there is no fundamental hardware limitation standing in the way.
+
+Many use-cases for function pointers in shaders are already adequately solved by tail-calls alone: many material systems are simply chaining together smaller functions which can be expressed manually rather naturally.
+
+Compilers are intended to be direct application of this extension because they can lower indirect function calls to continuation-passing-style (CpS) which is directly expressible in terms of tailcalls.
+
+== Validation and Tools
+
+This extension is inherently unsafe due to the manipulation of raw function pointer values, but could be sanitized at runtime.
+To validate function pointers, they could be checked against the linked function pool.
+
+The `IndirectUnsafe` decoration allows recursion in a context where it cannot be supported. GPU assisted validation could use invocation-private flags to guard against re-entrancy dynamically and bail out.
+Similarily, the stack would need validation against overflow.
+
+TBD: renderdoc and such replay
+
+== Further Functionality
+
+TBD: normal tailcalls ?
